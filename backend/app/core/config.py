@@ -14,13 +14,16 @@ class Settings(BaseSettings):
     dashboard_api_key: str | None = None
     portfolio_owner: str | None = None
     portfolio_repo: str | None = None
+    portfolio_worktree: str | None = None
+    portfolio_validation_command: str | None = None
+    portfolio_validation_timeout_seconds: int = 300
     llm_provider: str = "openai"
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4.1-mini"
     openai_api_key: str | None = None
     groq_api_key: str | None = None
     portfolio_confidence_threshold: float = 0.85
-    auto_create_pr: bool = True
+    auto_create_pr: bool = False
     auto_merge: bool = False
     auto_update_skills: bool = True
     auto_update_timeline: bool = True

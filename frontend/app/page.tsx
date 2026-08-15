@@ -1,8 +1,8 @@
 "use client";
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { getRepositories, getUpdates, getAnalyses } from "@/lib/api";
-import type { Repository, PortfolioUpdate, Analysis } from "@/lib/types";
+import { getRepositories, getUpdates, getAnalyses, getActivity } from "@/lib/api";
+import type { Repository, PortfolioUpdate, Analysis, WorkflowEvent } from "@/lib/types";
 import Badge from "@/components/Badge";
 
 function StatCard({ label, value, sub }: { label: string; value: number | string; sub?: string }) {
@@ -31,22 +31,29 @@ export default function OverviewPage() {
   const [repos, setRepos] = useState<Repository[]>([]);
   const [updates, setUpdates] = useState<PortfolioUpdate[]>([]);
   const [analyses, setAnalyses] = useState<Analysis[]>([]);
+  const [activity, setActivity] = useState<WorkflowEvent[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
 
   const load = async () => {
     setLoading(true);
     setError("");
-    try {
-      const [r, u, a] = await Promise.all([getRepositories(), getUpdates(), getAnalyses()]);
-      setRepos(r);
-      setUpdates(u);
-      setAnalyses(a);
-    } catch {
-      setError("Backend is unavailable. Start the FastAPI server or Docker Compose.");
-    } finally {
-      setLoading(false);
+    const [repositoryResult, updateResult, analysisResult, activityResult] = await Promise.allSettled([
+      getRepositories(), getUpdates(), getAnalyses(), getActivity(30),
+    ]);
+    const failures: string[] = [];
+    if (repositoryResult.status === "fulfilled") setRepos(repositoryResult.value);
+    else failures.push(`repositories: ${repositoryResult.reason instanceof Error ? repositoryResult.reason.message : "request failed"}`);
+    if (updateResult.status === "fulfilled") setUpdates(updateResult.value);
+    else failures.push(`updates: ${updateResult.reason instanceof Error ? updateResult.reason.message : "request failed"}`);
+    if (analysisResult.status === "fulfilled") setAnalyses(analysisResult.value);
+    else failures.push(`analyses: ${analysisResult.reason instanceof Error ? analysisResult.reason.message : "request failed"}`);
+    if (activityResult.status === "fulfilled") setActivity(activityResult.value);
+    // Activity is best-effort; don't surface its failure as a top-level error.
+    if (failures.length) {
+      setError(`Some dashboard data could not load — ${failures.join("; ")}`);
     }
+    setLoading(false);
   };
 
   useEffect(() => { load(); }, []);
@@ -128,6 +135,7 @@ export default function OverviewPage() {
                     </p>
                     <p className="text-xs" style={{ color: "var(--muted)" }}>
                       {r.portfolio_project_id ? `→ ${r.portfolio_project_id}` : "Not mapped"}
+                      {r.is_portfolio ? " · portfolio repo" : ""}
                     </p>
                   </div>
                   <Badge status={r.enabled ? "analyzed" : "failed"} />
@@ -137,7 +145,7 @@ export default function OverviewPage() {
           )}
         </div>
 
-        {/* Recent activity */}
+        {/* Recent portfolio updates */}
         <div className="card">
           <div className="flex items-center justify-between mb-4">
             <h2 className="font-semibold">Recent updates</h2>
@@ -177,6 +185,44 @@ export default function OverviewPage() {
           )}
         </div>
       </div>
+
+      {/* Activity feed */}
+      {activity.length > 0 && (
+        <div className="card mt-6">
+          <h2 className="font-semibold mb-3">Activity feed</h2>
+          <div className="space-y-0">
+            {activity.map((ev) => (
+              <div
+                key={ev.id}
+                className="flex items-start gap-3 py-2 text-sm"
+                style={{ borderBottom: "1px solid var(--border)" }}
+              >
+                <span
+                  className="shrink-0 rounded px-1.5 py-0.5 text-xs font-mono"
+                  style={{ background: "var(--surface-2)", color: "var(--accent)" }}
+                >
+                  {ev.stage.replace(/_/g, " ")}
+                </span>
+                <span className="min-w-0 truncate" style={{ color: "var(--muted)" }}>
+                  {ev.detail ?? ""}
+                  {ev.update_id && (
+                    <Link
+                      href={`/updates/${ev.update_id}`}
+                      className="ml-2"
+                      style={{ color: "var(--accent)" }}
+                    >
+                      update #{ev.update_id}
+                    </Link>
+                  )}
+                </span>
+                <span className="ml-auto shrink-0 text-xs" style={{ color: "var(--muted)" }}>
+                  {timeAgo(ev.created_at)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* First-run callout */}
       {!loading && repos.length === 0 && (

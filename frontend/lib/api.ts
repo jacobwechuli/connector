@@ -14,6 +14,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`${res.status}: ${text}`);
   }
+  if (res.status === 204) return undefined as T;
   return res.json();
 }
 
@@ -24,13 +25,17 @@ export const addRepository = (body: object) =>
 export const updateRepository = (id: number, body: object) =>
   request<import("./types").Repository>(`/repositories/${id}`, { method: "PATCH", body: JSON.stringify(body) });
 export const deleteRepository = (id: number) =>
-  fetch(`${API}/repositories/${id}`, { method: "DELETE" });
+  request<void>(`/repositories/${id}`, { method: "DELETE" });
+export const getGitHubStatus = () => request<import("./types").GitHubAccount>("/github/status");
+export const getGitHubRepositories = () => request<import("./types").GitHubRepository[]>("/github/repositories");
 
 // Commits
 export const getRepositoryCommits = (repoId: number) =>
   request<import("./types").Commit[]>(`/repositories/${repoId}/commits`);
 export const analyzeCommit = (commitId: number) =>
   request<{ status: string }>(`/commits/${commitId}/analyze`, { method: "POST" });
+export const syncRepository = (repoId: number) =>
+  request<{ status: string; commits: number }>(`/repositories/${repoId}/sync`, { method: "POST" });
 export const getCommitAnalysis = (commitId: number) =>
   request<import("./types").Analysis>(`/commits/${commitId}/analysis`);
 
@@ -51,6 +56,10 @@ export const createPR = (id: number) =>
   request<{ status: string; pr_number?: number }>(`/updates/${id}/create-pr`, { method: "POST" });
 export const revertUpdate = (id: number) =>
   request<{ status: string }>(`/updates/${id}/revert`, { method: "POST" });
+
+// Activity
+export const getActivity = (limit = 50) =>
+  request<import("./types").WorkflowEvent[]>(`/activity?limit=${limit}`);
 
 // Health
 export const getHealth = () => request<{ status: string }>("/health");

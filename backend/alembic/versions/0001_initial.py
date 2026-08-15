@@ -21,7 +21,7 @@ def upgrade() -> None:
         sa.Column("name", sa.String(120), nullable=False),
         sa.Column("portfolio_project_id", sa.String(160), nullable=True),
         sa.Column("enabled", sa.Boolean, nullable=False, server_default="1"),
-        sa.Column("auto_create_pr", sa.Boolean, nullable=False, server_default="1"),
+        sa.Column("auto_create_pr", sa.Boolean, nullable=False, server_default=sa.false()),
         sa.Column("auto_merge", sa.Boolean, nullable=False, server_default="0"),
         sa.Column("is_portfolio", sa.Boolean, nullable=False, server_default="0"),
         sa.Column("created_at", sa.DateTime, nullable=False),

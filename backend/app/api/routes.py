@@ -9,20 +9,34 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.database import get_db
-from app.models import Analysis, Commit, PortfolioUpdate, Repository, WebhookEvent
+from app.github.client import GitHubClient
+from app.models import Analysis, Commit, PortfolioUpdate, Repository, WebhookEvent, WorkflowEvent
 from app.schemas.contracts import (
     AnalysisOut,
     CommitOut,
     RepositoryCreate,
     RepositoryOut,
+    GitHubAccountOut,
+    GitHubRepositoryOut,
     UpdateOut,
+    WorkflowEventOut,
 )
-from app.services.pipeline import AnalysisPipeline
+from app.services.pipeline import AnalysisPipeline, _emit
 from app.services.security import verify_github_signature
 from app.workers.jobs import analyze_commit_job
 
 log = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _record_update_event(item: PortfolioUpdate, event: str) -> None:
+    """Append an auditable lifecycle stage without requiring a schema change."""
+    result = dict(item.validation_result or {})
+    events = list(result.get("events", []))
+    if event not in events:
+        events.append(event)
+    result["events"] = events
+    item.validation_result = result
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +66,44 @@ def add_repository(body: RepositoryCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(item)
     return item
+
+
+@router.get("/github/status", response_model=GitHubAccountOut)
+def github_status():
+    """Validate configured GitHub credentials and reveal their account."""
+    try:
+        account = GitHubClient().authenticated_account()
+        return GitHubAccountOut(
+            connected=True,
+            login=account.get("login"),
+            avatar_url=account.get("avatar_url"),
+        )
+    except Exception as exc:
+        # Do not expose tokens or raw GitHub errors to the browser.
+        return GitHubAccountOut(connected=False, message=str(exc)[:300])
+
+
+@router.get("/github/repositories", response_model=list[GitHubRepositoryOut])
+def github_repositories(db: Session = Depends(get_db)):
+    """Discover repositories accessible to the configured GitHub credential."""
+    try:
+        items = GitHubClient().accessible_repositories()
+    except Exception as exc:
+        raise HTTPException(502, f"Could not read GitHub repositories: {str(exc)[:300]}") from exc
+
+    connected = {(repo.owner, repo.name) for repo in db.query(Repository).all()}
+    return [
+        GitHubRepositoryOut(
+            owner=item.get("owner", {}).get("login", ""),
+            name=item.get("name", ""),
+            full_name=item.get("full_name", ""),
+            private=bool(item.get("private")),
+            default_branch=item.get("default_branch") or "main",
+            connected=(item.get("owner", {}).get("login", ""), item.get("name", "")) in connected,
+        )
+        for item in items
+        if item.get("owner", {}).get("login") and item.get("name")
+    ]
 
 
 @router.patch("/repositories/{repository_id}", response_model=RepositoryOut)
@@ -86,6 +138,36 @@ def repository_commits(repository_id: int, db: Session = Depends(get_db)):
         .limit(50)
         .all()
     )
+
+
+@router.post("/repositories/{repository_id}/sync")
+def sync_repository(
+    repository_id: int,
+    tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Import recent GitHub commits and queue any new ones for analysis."""
+    repository = db.get(Repository, repository_id)
+    if not repository:
+        raise HTTPException(404, "repository not found")
+    try:
+        recent = GitHubClient().recent_commits(repository.owner, repository.name)
+    except Exception as exc:
+        raise HTTPException(502, f"Could not fetch commits: {str(exc)[:300]}") from exc
+
+    queued = 0
+    for raw in recent:
+        sha = raw.get("sha", "")
+        if not sha or db.query(Commit).filter_by(repository_id=repository.id, sha=sha).first():
+            continue
+        message = raw.get("commit", {}).get("message", "")
+        commit = Commit(repository_id=repository.id, sha=sha, message=message)
+        db.add(commit)
+        db.flush()
+        tasks.add_task(analyze_commit_job, commit.id)
+        queued += 1
+    db.commit()
+    return {"status": "queued", "commits": queued}
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +220,11 @@ def approve(update_id: int, db: Session = Depends(get_db)):
     if item.status not in {"pending", "approved"}:
         raise HTTPException(409, f"cannot approve a '{item.status}' update")
     item.status = "approved"
+    _record_update_event(item, "approved")
+    commit = db.get(Commit, item.commit_id)
+    _emit(db, "approved",
+          repository_id=commit.repository_id if commit else None,
+          commit_id=item.commit_id, update_id=update_id)
     db.commit()
     return {"status": item.status}
 
@@ -150,6 +237,11 @@ def reject(update_id: int, db: Session = Depends(get_db)):
     if item.status not in {"pending", "rejected"}:
         raise HTTPException(409, f"cannot reject a '{item.status}' update")
     item.status = "rejected"
+    _record_update_event(item, "rejected")
+    commit = db.get(Commit, item.commit_id)
+    _emit(db, "rejected",
+          repository_id=commit.repository_id if commit else None,
+          commit_id=item.commit_id, update_id=update_id)
     db.commit()
     return {"status": item.status}
 
@@ -169,6 +261,7 @@ def create_portfolio_pr(update_id: int, db: Session = Depends(get_db)):
         AnalysisPipeline(db).create_pr(item, commit, source)
     except (RuntimeError, ValueError) as exc:
         item.error_message = str(exc)[:2000]
+        _record_update_event(item, "pr_creation_failed")
         db.commit()
         raise HTTPException(422, str(exc)) from exc
     return {"status": item.status, "pr_number": item.pr_number}
@@ -190,6 +283,21 @@ def revert_update(update_id: int, db: Session = Depends(get_db)):
         "branch": item.branch,
         "pr_number": item.pr_number,
     }
+
+
+# ---------------------------------------------------------------------------
+# Activity feed
+# ---------------------------------------------------------------------------
+
+@router.get("/activity", response_model=list[WorkflowEventOut])
+def list_activity(limit: int = 50, db: Session = Depends(get_db)):
+    """Return the most recent workflow events across all repositories."""
+    return (
+        db.query(WorkflowEvent)
+        .order_by(WorkflowEvent.id.desc())
+        .limit(min(limit, 200))
+        .all()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +337,9 @@ async def github_webhook(
 
     # Idempotency – ignore replayed deliveries.
     if db.query(WebhookEvent).filter_by(delivery_id=x_github_delivery).first():
+        _emit(db, "webhook_ignored",
+              detail=f"duplicate delivery {x_github_delivery[:40]}")
+        db.commit()
         return {"status": "duplicate"}
 
     payload = json.loads(raw)
@@ -246,6 +357,7 @@ async def github_webhook(
         _handle_pull_request(payload, event, db)
     else:
         event.status = "ignored"
+        _emit(db, "webhook_ignored", detail=f"event={x_github_event[:40]}")
 
     db.commit()
     return {"status": event.status, **extra}
@@ -258,11 +370,19 @@ def _handle_push(payload: dict, event: WebhookEvent, tasks: BackgroundTasks, db:
         name=info.get("name"),
     ).first()
 
+    repo_id = repository.id if repository else None
+
     # Ignore pushes from our own bot or untracked / disabled repos.
     pusher = payload.get("pusher", {}).get("name", "")
     if not repository or not repository.enabled or pusher.endswith("[bot]"):
         event.status = "ignored"
+        _emit(db, "webhook_ignored",
+              repository_id=repo_id,
+              detail=f"push ignored: pusher={pusher[:40]} enabled={getattr(repository, 'enabled', False)}")
         return {}
+
+    _emit(db, "webhook_received", repository_id=repo_id,
+          detail=f"push from {pusher[:40]}")
 
     queued = 0
     for incoming in payload.get("commits", []):
@@ -305,8 +425,12 @@ def _handle_pull_request(payload: dict, event: WebhookEvent, db: Session) -> Non
     if update:
         if merged:
             update.status = "merged"
+            _emit(db, "merged", commit_id=update.commit_id, update_id=update.id,
+                  detail=f"PR #{pr_number} merged")
         elif pr_state == "closed":
             update.status = "pr_closed"
+            _emit(db, "pr_closed", commit_id=update.commit_id, update_id=update.id,
+                  detail=f"PR #{pr_number} closed")
         # For 'synchronize', 'review_requested', etc. – no status change needed.
 
     event.status = f"pr_{action}"

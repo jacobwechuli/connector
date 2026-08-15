@@ -162,6 +162,24 @@ cd backend
 alembic upgrade head
 ```
 
+### Review-first portfolio workflow
+
+The dashboard discovers repositories through the configured GitHub PAT or GitHub
+App, but it never writes to GitHub when a commit first arrives. A meaningful
+commit moves through: **webhook received → commit evidence fetched → AI analysis
+→ constrained operations validated → review diff ready → human approval → local
+portfolio validation command → branch/commit/PR**.
+
+To require a real portfolio build or test before opening a PR, set:
+
+```env
+PORTFOLIO_WORKTREE=/absolute/path/to/your/portfolio-checkout
+PORTFOLIO_VALIDATION_COMMAND=npm run build
+```
+
+For Docker Compose, set `PORTFOLIO_WORKTREE_HOST_PATH` to the same checkout on
+your host. Inside the container it is available at `/portfolio-worktree`.
+
 ### 4 – Start the backend
 
 ```bash

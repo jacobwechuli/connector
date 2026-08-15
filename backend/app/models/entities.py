@@ -15,7 +15,7 @@ class Repository(Base):
     name: Mapped[str] = mapped_column(String(120))
     portfolio_project_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    auto_create_pr: Mapped[bool] = mapped_column(Boolean, default=True)
+    auto_create_pr: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_merge: Mapped[bool] = mapped_column(Boolean, default=False)
     is_portfolio: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
@@ -70,4 +70,15 @@ class PortfolioUpdate(Base):
     branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
     pr_number: Mapped[int | None] = mapped_column(nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class WorkflowEvent(Base):
+    __tablename__ = "workflow_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    repository_id: Mapped[int | None] = mapped_column(ForeignKey("repositories.id"), nullable=True)
+    commit_id: Mapped[int | None] = mapped_column(ForeignKey("commits.id"), nullable=True)
+    update_id: Mapped[int | None] = mapped_column(ForeignKey("portfolio_updates.id"), nullable=True)
+    stage: Mapped[str] = mapped_column(String(64))
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)

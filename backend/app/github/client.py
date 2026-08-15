@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import base64
+import logging
 import time
 from typing import Any
 
 import httpx
 from app.core.config import get_settings
+
+
+log = logging.getLogger(__name__)
+
+
+def _normalise_private_key(raw: str) -> str:
+    """Convert literal \\n sequences (common in .env files) to real newlines."""
+    if "\n" not in raw and "\\n" in raw:
+        raw = raw.replace("\\n", "\n")
+    return raw.strip()
 
 
 def _make_app_jwt(app_id: str, private_key: str) -> str:
@@ -17,7 +28,7 @@ def _make_app_jwt(app_id: str, private_key: str) -> str:
 
     now = int(time.time())
     payload = {"iat": now - 60, "exp": now + 60, "iss": app_id}
-    return jwt.encode(payload, private_key, algorithm="RS256")
+    return jwt.encode(payload, _normalise_private_key(private_key), algorithm="RS256")
 
 
 class GitHubClient:
@@ -38,7 +49,25 @@ class GitHubClient:
         if token:
             self.token = token
         elif settings.github_app_id and settings.github_private_key:
-            self.token = self._installation_token(settings.github_app_id, settings.github_private_key)
+            try:
+                self.token = self._installation_token(
+                    settings.github_app_id,
+                    _normalise_private_key(settings.github_private_key),
+                )
+            except Exception as exc:
+                # App auth failed (malformed key, no installations, network error, etc.).
+                # Fall back to a PAT when one is configured so a broken App key
+                # does not block access when the user has a working GITHUB_TOKEN.
+                if settings.github_token:
+                    log.warning(
+                        "GitHub App authentication failed; falling back to GITHUB_TOKEN: %s", exc
+                    )
+                    self.token = settings.github_token
+                else:
+                    raise RuntimeError(
+                        f"GitHub App authentication failed ({exc}). "
+                        "Fix GITHUB_APP_ID / GITHUB_PRIVATE_KEY, or set GITHUB_TOKEN as a fallback."
+                    ) from exc
         elif settings.github_token:
             self.token = settings.github_token
         else:
@@ -93,6 +122,30 @@ class GitHubClient:
 
     def repo(self, owner: str, repo: str) -> dict:
         return self._get(f"/repos/{owner}/{repo}")
+
+    def authenticated_account(self) -> dict:
+        """Return the account represented by the configured GitHub credential."""
+        try:
+            return self._get("/user")
+        except httpx.HTTPStatusError:
+            # GitHub App installation tokens have no `/user` identity. Use the
+            # owner of an installed repository as the visible account instead.
+            repositories = self.accessible_repositories()
+            if repositories:
+                return repositories[0].get("owner", {})
+            return {}
+
+    def accessible_repositories(self) -> list[dict]:
+        """List repositories visible to a PAT or GitHub App installation token."""
+        try:
+            return self._get("/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator")
+        except httpx.HTTPStatusError as user_error:
+            # Installation tokens do not have a user context. They can list the
+            # repositories selected when the GitHub App was installed instead.
+            try:
+                return self._get("/installation/repositories?per_page=100").get("repositories", [])
+            except httpx.HTTPStatusError:
+                raise user_error
 
     def readme(self, owner: str, repo: str) -> str:
         try:

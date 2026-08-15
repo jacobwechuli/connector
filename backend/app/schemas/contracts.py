@@ -86,13 +86,40 @@ class RepositoryCreate(BaseModel):
     name: str
     portfolio_project_id: str | None = None
     enabled: bool = True
-    auto_create_pr: bool = True
+    auto_create_pr: bool = False
     auto_merge: bool = False
     is_portfolio: bool = False
 
 
 class RepositoryOut(RepositoryCreate):
     id: int
+    model_config = ConfigDict(from_attributes=True)
+
+
+class GitHubAccountOut(BaseModel):
+    connected: bool
+    login: str | None = None
+    avatar_url: str | None = None
+    message: str | None = None
+
+
+class GitHubRepositoryOut(BaseModel):
+    owner: str
+    name: str
+    full_name: str
+    private: bool
+    default_branch: str
+    connected: bool
+
+
+class WorkflowEventOut(BaseModel):
+    id: int
+    repository_id: int | None = None
+    commit_id: int | None = None
+    update_id: int | None = None
+    stage: str
+    detail: str | None = None
+    created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
 

@@ -7,8 +7,11 @@ import {
   deleteRepository,
   getRepositoryCommits,
   analyzeCommit,
+  getGitHubStatus,
+  getGitHubRepositories,
+  syncRepository,
 } from "@/lib/api";
-import type { Repository, Commit } from "@/lib/types";
+import type { Repository, Commit, GitHubAccount, GitHubRepository } from "@/lib/types";
 import Badge from "@/components/Badge";
 import Link from "next/link";
 
@@ -27,13 +30,16 @@ const EMPTY: FormData = {
   name: "",
   portfolio_project_id: "",
   enabled: true,
-  auto_create_pr: true,
+  auto_create_pr: false,
   auto_merge: false,
   is_portfolio: false,
 };
 
 export default function RepositoriesPage() {
   const [repos, setRepos] = useState<Repository[]>([]);
+  const [github, setGithub] = useState<GitHubAccount | null>(null);
+  const [discovered, setDiscovered] = useState<GitHubRepository[]>([]);
+  const [showDiscovery, setShowDiscovery] = useState(false);
   const [editing, setEditing] = useState<Repository | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState<FormData>(EMPTY);
@@ -45,12 +51,41 @@ export default function RepositoriesPage() {
   const load = async () => {
     try {
       setRepos(await getRepositories());
-    } catch {
-      setError("Could not load repositories.");
+    } catch (e: unknown) {
+      setError(e instanceof Error ? `Could not load repositories: ${e.message}` : "Could not load repositories.");
     }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    getGitHubStatus().then(setGithub).catch((e: unknown) => {
+      setGithub({ connected: false, login: null, avatar_url: null, message: e instanceof Error ? e.message : "Unable to check GitHub." });
+    });
+  }, []);
+
+  const discoverRepositories = async () => {
+    setError("");
+    try {
+      setDiscovered(await getGitHubRepositories());
+      setShowDiscovery(true);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Could not discover GitHub repositories.");
+    }
+  };
+
+  const connectDiscovered = async (repo: GitHubRepository, asPortfolio = false) => {
+    setSaving(true);
+    setError("");
+    try {
+      await addRepository({ ...EMPTY, owner: repo.owner, name: repo.name, is_portfolio: asPortfolio });
+      await load();
+      setDiscovered((items) => items.map((item) => item.full_name === repo.full_name ? { ...item, connected: true } : item));
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Could not connect repository.");
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const openAdd = () => {
     setEditing(null);
@@ -115,6 +150,19 @@ export default function RepositoriesPage() {
     setCommits((prev) => ({ ...prev, [repoId]: c }));
   };
 
+  const sync = async (repoId: number) => {
+    setError("");
+    try {
+      const result = await syncRepository(repoId);
+      const updated = await getRepositoryCommits(repoId);
+      setCommits((prev) => ({ ...prev, [repoId]: updated }));
+      setExpanded(repoId);
+      if (result.commits === 0) setError("No new commits found to analyze.");
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Could not import commits.");
+    }
+  };
+
   const field = (key: keyof FormData) => (e: React.ChangeEvent<HTMLInputElement>) => {
     const value = e.target.type === "checkbox" ? e.target.checked : e.target.value;
     setForm((f) => ({ ...f, [key]: value }));
@@ -129,7 +177,18 @@ export default function RepositoriesPage() {
             Manage which GitHub repositories are monitored.
           </p>
         </div>
-        <button onClick={openAdd} className="btn btn-primary">+ Connect repository</button>
+        <div className="flex gap-2">
+          <button onClick={discoverRepositories} className="btn btn-ghost">Discover GitHub repos</button>
+          <button onClick={openAdd} className="btn btn-primary">+ Connect repository</button>
+        </div>
+      </div>
+
+      <div className="card mb-6 text-sm">
+        {github?.connected ? (
+          <span>GitHub connected as <strong>{github.login}</strong>. Choose a repository below to monitor it.</span>
+        ) : (
+          <span style={{ color: "#f85149" }}>GitHub is not connected. Set a valid <code>GITHUB_TOKEN</code> or GitHub App credentials, then restart the backend.{github?.message ? ` (${github.message})` : ""}</span>
+        )}
       </div>
 
       {error && (
@@ -137,6 +196,43 @@ export default function RepositoriesPage() {
           style={{ background: "#1a0d0d", color: "#f85149", border: "1px solid #da363355" }}>
           {error}
         </p>
+      )}
+
+      {showDiscovery && (
+        <div className="card mb-6" style={{ borderColor: "var(--accent)55" }}>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="font-semibold">GitHub repositories</h2>
+            <button className="btn btn-ghost" onClick={() => setShowDiscovery(false)}>Close</button>
+          </div>
+          {discovered.length === 0 ? (
+            <p className="text-sm" style={{ color: "var(--muted)" }}>No repositories are visible to this GitHub credential.</p>
+          ) : (
+            <div className="space-y-2">
+              {discovered.map((repo) => (
+                <div key={repo.full_name} className="flex items-center justify-between py-2" style={{ borderBottom: "1px solid var(--border)" }}>
+                  <div>
+                    <span className="text-sm">{repo.full_name}{repo.private ? " · private" : ""}</span>
+                    <p className="text-xs mt-0.5" style={{ color: "var(--muted)" }}>
+                      Connect as <em>dev repo</em> to monitor commits, or as <em>portfolio repo</em> to write updates to it.
+                    </p>
+                  </div>
+                  {repo.connected ? (
+                    <span className="text-xs" style={{ color: "var(--muted)" }}>Connected</span>
+                  ) : (
+                    <div className="flex gap-2">
+                      <button className="btn btn-ghost" style={{ fontSize: "0.75rem" }} disabled={saving} onClick={() => connectDiscovered(repo, false)}>
+                        + Dev repo
+                      </button>
+                      <button className="btn btn-primary" style={{ fontSize: "0.75rem" }} disabled={saving} onClick={() => connectDiscovered(repo, true)}>
+                        + Portfolio repo
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       )}
 
       {/* Add/edit form */}
@@ -221,6 +317,7 @@ export default function RepositoriesPage() {
                   </p>
                 </div>
                 <div className="flex gap-2">
+                  <button onClick={() => sync(r.id)} className="btn btn-ghost" style={{ fontSize: "0.75rem" }}>Import commits</button>
                   <button
                     onClick={() => toggleExpand(r)}
                     className="btn btn-ghost"

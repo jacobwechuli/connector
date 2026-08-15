@@ -3,19 +3,45 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from datetime import datetime, timezone
 from difflib import unified_diff
+from pathlib import Path
 
 from sqlalchemy.orm import Session
 
 from app.ai.provider import get_provider
 from app.core.config import get_settings
 from app.github.client import GitHubClient
-from app.models import Analysis, Commit, PortfolioUpdate, Repository
+from app.models import Analysis, Commit, PortfolioUpdate, Repository, WorkflowEvent
 from app.portfolio.updater import PortfolioUpdater
 from app.schemas.contracts import PortfolioPatch, Significance
 
 log = logging.getLogger(__name__)
+
+
+def _emit(
+    db: Session,
+    stage: str,
+    *,
+    repository_id: int | None = None,
+    commit_id: int | None = None,
+    update_id: int | None = None,
+    detail: str | None = None,
+) -> None:
+    """Persist a single WorkflowEvent row.  Never raises — failures are logged."""
+    try:
+        ev = WorkflowEvent(
+            stage=stage,
+            repository_id=repository_id,
+            commit_id=commit_id,
+            update_id=update_id,
+            detail=detail,
+        )
+        db.add(ev)
+        db.flush()
+    except Exception as exc:  # pragma: no cover
+        log.warning("Could not persist workflow event %r: %s", stage, exc)
 
 
 class AnalysisPipeline:
@@ -42,8 +68,12 @@ class AnalysisPipeline:
         repo: Repository = commit.repository
         provider = get_provider()
 
+        _emit(self.db, "commit_queued", repository_id=repo.id, commit_id=commit.id)
+
         # Fetch commit evidence from GitHub.
         evidence = self.github.commit(repo.owner, repo.name, commit.sha)
+        _emit(self.db, "commit_evidence_fetched", repository_id=repo.id, commit_id=commit.id,
+              detail=f"{len(evidence.get('files', []))} files")
         files = [
             {
                 "filename": f["filename"],
@@ -67,6 +97,7 @@ class AnalysisPipeline:
             "portfolio_project_id": repo.portfolio_project_id,
         }
 
+        _emit(self.db, "analysis_started", repository_id=repo.id, commit_id=commit.id)
         result = provider.analyze(context)
         log.info(
             "analysis complete repo=%s sha=%s worthy=%s confidence=%.2f significance=%s",
@@ -75,6 +106,11 @@ class AnalysisPipeline:
             result.portfolio_worthy,
             result.confidence,
             result.significance.value,
+        )
+        _emit(
+            self.db, "analysis_complete",
+            repository_id=repo.id, commit_id=commit.id,
+            detail=f"worthy={result.portfolio_worthy} significance={result.significance.value} confidence={result.confidence:.2f}",
         )
 
         analysis = Analysis(
@@ -97,6 +133,8 @@ class AnalysisPipeline:
             not result.portfolio_worthy
             or result.confidence < self.settings.portfolio_confidence_threshold
         ):
+            _emit(self.db, "not_portfolio_worthy", repository_id=repo.id, commit_id=commit.id,
+                  detail=f"significance={result.significance.value} confidence={result.confidence:.2f}")
             self.db.commit()
             return None
 
@@ -115,6 +153,8 @@ class AnalysisPipeline:
         patch = self._apply_automation_settings(patch)
 
         if not patch.operations:
+            _emit(self.db, "not_portfolio_worthy", repository_id=repo.id, commit_id=commit.id,
+                  detail="empty patch operations after automation filters")
             self.db.commit()
             return None
 
@@ -123,8 +163,13 @@ class AnalysisPipeline:
             updater.validate(patch, repo.portfolio_project_id, result.significance)
         except ValueError as exc:
             log.warning("patch validation failed: %s", exc)
+            _emit(self.db, "not_portfolio_worthy", repository_id=repo.id, commit_id=commit.id,
+                  detail=f"patch validation failed: {str(exc)[:200]}")
             self.db.commit()
             return None
+
+        _emit(self.db, "operations_validated", repository_id=repo.id, commit_id=commit.id,
+              detail=f"{len(patch.operations)} operations")
 
         update = PortfolioUpdate(
             commit_id=commit.id,
@@ -135,6 +180,31 @@ class AnalysisPipeline:
         self.db.add(update)
         self.db.commit()
         self.db.refresh(update)
+
+        # Materialize a read-only preview now, while the update is still
+        # pending. This is what the reviewer approves; no branch or GitHub
+        # write is made at this stage.
+        try:
+            update.diff = self.preview(update)
+            update.validation_result = {
+                "operations_valid": True,
+                "secret_scan": "passed",
+                "preview": "ready",
+                "events": ["commit_analyzed", "operations_validated", "diff_ready"],
+            }
+            _emit(self.db, "diff_ready", repository_id=repo.id, commit_id=commit.id,
+                  update_id=update.id)
+        except Exception as exc:
+            update.error_message = f"Could not prepare review diff: {exc}"[:2000]
+            update.validation_result = {
+                "operations_valid": True,
+                "secret_scan": "pending",
+                "preview": "failed",
+                "events": ["commit_analyzed", "operations_validated", "diff_failed"],
+            }
+            _emit(self.db, "diff_failed", repository_id=repo.id, commit_id=commit.id,
+                  update_id=update.id, detail=str(exc)[:200])
+        self.db.commit()
 
         log.info("portfolio update created id=%d", update.id)
 
@@ -151,6 +221,40 @@ class AnalysisPipeline:
                 self.db.commit()
 
         return update
+
+    def preview(self, update: PortfolioUpdate) -> str:
+        """Build a review diff without writing a branch or modifying GitHub."""
+        s = self.settings
+        if not s.portfolio_owner or not s.portfolio_repo:
+            raise RuntimeError("PORTFOLIO_OWNER and PORTFOLIO_REPO must be configured")
+
+        gh = self.github
+        metadata = gh.repo(s.portfolio_owner, s.portfolio_repo)
+        base = metadata.get("default_branch", "main")
+        patch = PortfolioPatch.model_validate(update.operations)
+        updater = PortfolioUpdater()
+        file_content: dict[str, str] = {}
+        for path in updater.required_paths(patch):
+            _, file_content[path] = gh.file(s.portfolio_owner, s.portfolio_repo, path, base)
+
+        writes = updater.materialize(patch, lambda path: file_content.get(path, ""))
+        return self._build_diff(file_content, writes)
+
+    @staticmethod
+    def _build_diff(file_content: dict[str, str], writes: dict[str, str]) -> str:
+        diff_parts: list[str] = []
+        for path, new_content in writes.items():
+            diff_parts.extend(
+                unified_diff(
+                    file_content.get(path, "").splitlines(keepends=True),
+                    new_content.splitlines(keepends=True),
+                    fromfile=f"a/{path}",
+                    tofile=f"b/{path}",
+                )
+            )
+        if not diff_parts:
+            raise ValueError("Proposed update does not change any portfolio files.")
+        return "".join(diff_parts)
 
     # ------------------------------------------------------------------
     # Phase 3 – Create pull request
@@ -178,7 +282,6 @@ class AnalysisPipeline:
         base_sha = gh._get(f"/repos/{owner}/{repo}/git/ref/heads/{base}")["object"]["sha"]
 
         branch = f"portfolio-sync/{source_repo.name}-{commit.sha[:7]}".lower()
-        patch = PortfolioUpdate.operations  # just a schema reference – parsed below
         patch = PortfolioPatch.model_validate(update.operations)
         updater = PortfolioUpdater()
 
@@ -210,25 +313,28 @@ class AnalysisPipeline:
         provider = get_provider()
         validation_ok, validation_notes = self._validate_patch_quality(provider, writes, commit)
         if not validation_ok:
+            _emit(self.db, "not_portfolio_worthy",
+                  repository_id=source_repo.id, commit_id=commit.id, update_id=update.id,
+                  detail=f"AI quality validation rejected: {validation_notes[:200]}")
+            self.db.commit()
             raise ValueError(f"AI quality validation rejected the patch: {validation_notes}")
 
-        # ----------------------------------------------------------------
-        # Build diff for display and PR description
-        # ----------------------------------------------------------------
-        diff_parts: list[str] = []
-        for path, new_content in writes.items():
-            old_content = file_content.get(path, "")
-            diff_parts.extend(
-                unified_diff(
-                    old_content.splitlines(keepends=True),
-                    new_content.splitlines(keepends=True),
-                    fromfile=f"a/{path}",
-                    tofile=f"b/{path}",
-                )
-            )
+        # Rebuild the diff against the current portfolio branch immediately
+        # before writing, then run the configured real validation command.
+        diff = self._build_diff(file_content, writes)
 
-        if not diff_parts:
-            raise ValueError("Proposed update does not change any portfolio files.")
+        _emit(self.db, "portfolio_validation_started",
+              repository_id=source_repo.id, commit_id=commit.id, update_id=update.id)
+        try:
+            validation_command = self._run_portfolio_validation(writes)
+        except RuntimeError as exc:
+            _emit(self.db, "portfolio_validation_failed",
+                  repository_id=source_repo.id, commit_id=commit.id, update_id=update.id,
+                  detail=str(exc)[:200])
+            self.db.commit()
+            raise
+        _emit(self.db, "portfolio_validation_passed",
+              repository_id=source_repo.id, commit_id=commit.id, update_id=update.id)
 
         # ----------------------------------------------------------------
         # Retrieve analysis for the PR description
@@ -238,7 +344,7 @@ class AnalysisPipeline:
             self.db.query(Analysis).filter_by(commit_id=commit.id).one_or_none()
         )
 
-        pr_body = self._build_pr_body(update, commit, source_repo, analysis, diff_parts)
+        pr_body = self._build_pr_body(update, commit, source_repo, analysis, [diff])
         pr_title = (
             f"chore(portfolio): update {source_repo.portfolio_project_id or source_repo.name}"
         )
@@ -251,25 +357,82 @@ class AnalysisPipeline:
         # Only create the branch and push files once everything is validated.
         # ----------------------------------------------------------------
         gh.create_branch(owner, repo, branch, base_sha)
+        _emit(self.db, "branch_created",
+              repository_id=source_repo.id, commit_id=commit.id, update_id=update.id,
+              detail=branch)
 
         for path, content in writes.items():
             blob_sha = file_meta[path].get("sha", "")
             gh.put_file(owner, repo, path, content, branch, blob_sha, commit_message)
 
         pr = gh.create_pr(owner, repo, pr_title, pr_body, branch, base)
+        _emit(self.db, "pr_created",
+              repository_id=source_repo.id, commit_id=commit.id, update_id=update.id,
+              detail=f"PR #{pr['number']}")
 
         update.branch = branch
         update.pr_number = pr["number"]
         update.status = "pr_created"
-        update.diff = "".join(diff_parts)
+        update.diff = diff
         update.validation_result = {
             "operations_valid": True,
             "secret_scan": "passed",
             "quality_validation": "passed",
             "quality_notes": validation_notes,
+            "portfolio_validation": "passed",
+            "validation_command": validation_command,
+            "events": ["diff_ready", "approved", "portfolio_validation_passed", "branch_created", "pr_created"],
         }
         self.db.commit()
         log.info("PR created #%d branch=%s", pr["number"], branch)
+
+    def _run_portfolio_validation(self, writes: dict[str, str]) -> str:
+        """Run the user-configured portfolio test/build command on candidate files.
+
+        The worktree is explicitly configured by the operator; candidate files
+        are restored even if validation fails.
+        """
+        command = self.settings.portfolio_validation_command
+        worktree = self.settings.portfolio_worktree
+        if not command or not worktree:
+            raise RuntimeError(
+                "Portfolio validation is required before creating a PR. Set "
+                "PORTFOLIO_WORKTREE and PORTFOLIO_VALIDATION_COMMAND."
+            )
+        root = Path(worktree).resolve()
+        if not root.is_dir():
+            raise RuntimeError(f"PORTFOLIO_WORKTREE does not exist: {root}")
+
+        originals: dict[Path, bytes | None] = {}
+        try:
+            for relative_path, content in writes.items():
+                target = (root / relative_path).resolve()
+                if root not in target.parents:
+                    raise RuntimeError(f"Unsafe validation path: {relative_path}")
+                originals[target] = target.read_bytes() if target.exists() else None
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+            result = subprocess.run(
+                command,
+                cwd=root,
+                shell=True,
+                text=True,
+                capture_output=True,
+                timeout=self.settings.portfolio_validation_timeout_seconds,
+                check=False,
+            )
+            output = (result.stdout + result.stderr).strip()
+            if result.returncode != 0:
+                raise RuntimeError(f"Portfolio validation failed ({result.returncode}): {output[-1500:]}")
+            return output[-1500:] or "Validation command passed."
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Portfolio validation timed out") from exc
+        finally:
+            for target, original in originals.items():
+                if original is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    target.write_bytes(original)
 
         # Honour auto-merge setting with strict safety checks.
         if s.auto_merge and source_repo.auto_merge:

@@ -418,6 +418,42 @@ class TestAnalysisPipeline:
         assert analysis.portfolio_worthy
         assert analysis.significance == "MAJOR"
 
+    def test_pending_update_contains_review_diff_before_approval(self, db):
+        repo = _make_repo(db)
+        repo.auto_create_pr = False
+        commit = Commit(repository_id=repo.id, sha="preview001", message="feat: add Redis caching")
+        db.add(commit)
+        db.commit()
+        db.refresh(commit)
+
+        provider = MagicMock()
+        provider.analyze.return_value = _worthy_analysis()
+        provider.patch.return_value = _simple_patch()
+        github = self._fake_github()
+        files = {
+            "data/skills.json": json.dumps(["Python"]),
+            "data/timeline.json": json.dumps([]),
+        }
+        github.file.side_effect = lambda owner, name, path, ref: ({"sha": "blob"}, files[path])
+
+        with patch("app.services.pipeline.get_provider", return_value=provider):
+            pipeline = AnalysisPipeline(db, github=github)
+            original_owner = pipeline.settings.portfolio_owner
+            original_repo = pipeline.settings.portfolio_repo
+            try:
+                pipeline.settings.portfolio_owner = "alice"
+                pipeline.settings.portfolio_repo = "portfolio"
+                result = pipeline.run(commit)
+            finally:
+                pipeline.settings.portfolio_owner = original_owner
+                pipeline.settings.portfolio_repo = original_repo
+
+        assert result is not None
+        assert result.status == "pending"
+        assert "data/skills.json" in (result.diff or "")
+        assert result.validation_result["preview"] == "ready"
+        assert "diff_ready" in result.validation_result["events"]
+
     def test_below_threshold_creates_no_update(self, db):
         repo = _make_repo(db)
         commit = Commit(repository_id=repo.id, sha="abc0003", message="feat: add minor thing")

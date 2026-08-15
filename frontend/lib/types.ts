@@ -13,6 +13,22 @@ export interface Repository {
   is_portfolio: boolean;
 }
 
+export interface GitHubAccount {
+  connected: boolean;
+  login: string | null;
+  avatar_url: string | null;
+  message: string | null;
+}
+
+export interface GitHubRepository {
+  owner: string;
+  name: string;
+  full_name: string;
+  private: boolean;
+  default_branch: string;
+  connected: boolean;
+}
+
 export interface Commit {
   id: number;
   repository_id: number;
@@ -65,4 +81,14 @@ export interface Operation {
   title?: string;
   description?: string;
   date?: string;
+}
+
+export interface WorkflowEvent {
+  id: number;
+  repository_id: number | null;
+  commit_id: number | null;
+  update_id: number | null;
+  stage: string;
+  detail: string | null;
+  created_at: string;
 }

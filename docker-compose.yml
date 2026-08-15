@@ -17,6 +17,12 @@ services:
     ports: ["8000:8000"]
     depends_on:
       postgres: {condition: service_healthy}
+    environment:
+      PORTFOLIO_WORKTREE: /portfolio-worktree
+    # Set PORTFOLIO_WORKTREE_HOST_PATH to the local checkout of the portfolio
+    # repository. The fallback is this project's sample portfolio data.
+    volumes:
+      - ${PORTFOLIO_WORKTREE_HOST_PATH:-./portfolio}:/portfolio-worktree
   frontend:
     build:
       context: ./frontend

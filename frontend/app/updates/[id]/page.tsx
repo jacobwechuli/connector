@@ -9,8 +9,9 @@ import {
   rejectUpdate,
   createPR,
   revertUpdate,
+  getActivity,
 } from "@/lib/api";
-import type { PortfolioUpdate, Analysis } from "@/lib/types";
+import type { PortfolioUpdate, Analysis, WorkflowEvent } from "@/lib/types";
 import Badge from "@/components/Badge";
 import DiffViewer from "@/components/DiffViewer";
 
@@ -36,6 +37,7 @@ export default function UpdateDetailPage({ params }: { params: Promise<{ id: str
   const { id } = use(params);
   const [update, setUpdate] = useState<PortfolioUpdate | null>(null);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [timeline, setTimeline] = useState<WorkflowEvent[]>([]);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
 
@@ -47,6 +49,11 @@ export default function UpdateDetailPage({ params }: { params: Promise<{ id: str
         const a = await getCommitAnalysis(u.commit_id);
         setAnalysis(a);
       } catch { /* no analysis yet */ }
+      try {
+        // Load all activity then filter client-side by update_id and commit_id.
+        const all = await getActivity(200);
+        setTimeline(all.filter((e) => e.update_id === u.id || e.commit_id === u.commit_id));
+      } catch { /* activity is best-effort */ }
     } catch {
       setError("Update not found.");
     }
@@ -79,6 +86,9 @@ export default function UpdateDetailPage({ params }: { params: Promise<{ id: str
   );
 
   const ops = update.operations?.operations ?? [];
+  const events = Array.isArray(update.validation_result?.events)
+    ? update.validation_result.events.map(String)
+    : [];
 
   return (
     <div>
@@ -102,6 +112,28 @@ export default function UpdateDetailPage({ params }: { params: Promise<{ id: str
           style={{ background: "#1a0d0d", color: "#f85149", border: "1px solid #da363355" }}>
           {error}
         </p>
+      )}
+
+      {/* Review-first workflow callout */}
+      {update.status === "pending" && (
+        <div
+          className="mb-4 rounded-lg p-3 text-sm"
+          style={{ background: "#0d1a2a", border: "1px solid var(--accent)44", color: "var(--muted)" }}
+        >
+          <strong style={{ color: "var(--text)" }}>Review before committing.</strong>{" "}
+          Approving marks this update as ready. You must then click{" "}
+          <em>Create PR</em> to run the configured validation command and push the branch.
+          No GitHub writes occur until you explicitly create the PR.
+        </div>
+      )}
+      {update.status === "approved" && !update.pr_number && (
+        <div
+          className="mb-4 rounded-lg p-3 text-sm"
+          style={{ background: "#0d1a0d", border: "1px solid #3fb95044", color: "var(--muted)" }}
+        >
+          <strong style={{ color: "var(--text)" }}>Approved — ready to publish.</strong>{" "}
+          Click <em>Create PR</em> to run the configured build/test command, then create a branch and pull request.
+        </div>
       )}
 
       {/* Action bar */}
@@ -130,7 +162,7 @@ export default function UpdateDetailPage({ params }: { params: Promise<{ id: str
             onClick={() => act("pr", () => createPR(update.id))}
             className="btn btn-primary"
           >
-            {busy === "pr" ? "Creating PR…" : "Create PR"}
+            {busy === "pr" ? "Running validation & creating PR…" : "Create PR"}
           </button>
         )}
         {["pr_created", "merged", "approved"].includes(update.status) && (
@@ -195,11 +227,46 @@ export default function UpdateDetailPage({ params }: { params: Promise<{ id: str
         )}
       </Section>
 
-      {/* Validation */}
+      {/* Workflow timeline from DB */}
+      <Section title="Workflow timeline">
+        {timeline.length > 0 ? (
+          <div className="space-y-0">
+            {[...timeline].reverse().map((ev) => (
+              <div
+                key={ev.id}
+                className="flex items-start gap-3 py-2 text-sm"
+                style={{ borderBottom: "1px solid var(--border)" }}
+              >
+                <span
+                  className="shrink-0 rounded px-1.5 py-0.5 text-xs font-mono"
+                  style={{ background: "var(--surface-2)", color: "var(--accent)" }}
+                >
+                  {ev.stage.replace(/_/g, " ")}
+                </span>
+                {ev.detail && (
+                  <span className="min-w-0 truncate text-xs" style={{ color: "var(--muted)" }}>
+                    {ev.detail}
+                  </span>
+                )}
+                <span className="ml-auto shrink-0 text-xs" style={{ color: "var(--muted)" }}>
+                  {new Date(ev.created_at).toLocaleTimeString()}
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : events.length > 0 ? (
+          <ol className="list-decimal list-inside space-y-1 text-sm" style={{ color: "var(--muted)" }}>
+            {events.map((event) => <li key={event}>{event.replace(/_/g, " ")}</li>)}
+          </ol>
+        ) : (
+          <p className="text-sm" style={{ color: "var(--muted)" }}>Waiting for processing events.</p>
+        )}
+      </Section>
+
       {update.validation_result && Object.keys(update.validation_result).length > 0 && (
         <Section title="Validation">
           {Object.entries(update.validation_result).map(([k, v]) => (
-            <KV key={k} label={k.replace(/_/g, " ")} value={String(v)} />
+            <KV key={k} label={k.replace(/_/g, " ")} value={Array.isArray(v) ? v.join(" → ") : String(v)} />
           ))}
         </Section>
       )}
