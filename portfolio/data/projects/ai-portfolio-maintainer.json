@@ -1,0 +1,15 @@
+{
+  "id": "ai-portfolio-maintainer",
+  "name": "AI Portfolio Maintainer",
+  "description": "Automated GitHub-to-portfolio synchronization powered by AI. Analyzes commit diffs, classifies significance, and opens PRs to keep the portfolio current.",
+  "url": "",
+  "technologies": ["Python", "FastAPI", "PostgreSQL", "Next.js", "TypeScript", "Docker", "OpenAI API"],
+  "features": [
+    "GitHub webhook ingestion with signature verification",
+    "AI-powered commit significance classification",
+    "Constrained portfolio patch generation",
+    "Second-pass quality validation before PR creation",
+    "Idempotent processing – no duplicate updates",
+    "MCP server for agent-to-agent access"
+  ]
+}
